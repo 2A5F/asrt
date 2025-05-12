@@ -28,7 +28,7 @@ impl From<u8> for TaskState {
     }
 }
 
-pub(crate) enum Event {
+pub(crate) enum Wait {
     Sync,
     Async(Waker),
 }
@@ -44,7 +44,7 @@ pub(crate) trait TTask<T>: ITask {
 
     fn condvar(&self) -> &Condvar;
 
-    fn result(&self) -> &Mutex<(Option<Event>, Option<Result<T, Box<dyn Any + Send>>>)>;
+    fn result(&self) -> &Mutex<(Option<Wait>, Option<Result<T, Box<dyn Any + Send>>>)>;
 }
 
 pub(crate) struct TaskInner<F>
@@ -55,10 +55,7 @@ where
     this: Weak<Self>,
     future: Mutex<F>,
     state: Mutex<Option<WakeState>>,
-    result: Mutex<(
-        Option<Event>,
-        Option<Result<F::Output, Box<dyn Any + Send>>>,
-    )>,
+    result: Mutex<(Option<Wait>, Option<Result<F::Output, Box<dyn Any + Send>>>)>,
     condvar: Condvar,
     task_state: AtomicU8,
 }
@@ -135,12 +132,7 @@ where
         &self.condvar
     }
 
-    fn result(
-        &self,
-    ) -> &Mutex<(
-        Option<Event>,
-        Option<Result<F::Output, Box<dyn Any + Send>>>,
-    )> {
+    fn result(&self) -> &Mutex<(Option<Wait>, Option<Result<F::Output, Box<dyn Any + Send>>>)> {
         &self.result
     }
 }
@@ -161,10 +153,10 @@ where
         self.task_state.store(state as u8, Relaxed);
         if let Some(ev) = result_place.0.take() {
             match ev {
-                Event::Sync => {
+                Wait::Sync => {
                     self.condvar.notify_one();
                 }
-                Event::Async(waker) => {
+                Wait::Async(waker) => {
                     waker.wake();
                 }
             }
@@ -243,15 +235,18 @@ impl<T> Debug for Task<T> {
 impl<T: Send + 'static> Task<T> {
     pub fn wait(self) -> Result<T, Box<dyn Any + Send>> {
         let scope = self.runtime.scope();
-        let mutex = Mutex::new(());
         loop {
-            if self.state() == TaskState::Pending {
+            let mut result = if self.state() == TaskState::Pending {
                 let mut result = self.inner.result().lock().unwrap();
-                result.0.replace(Event::Sync);
-                drop(result);
-                drop(self.inner.condvar().wait(mutex.lock().unwrap()).unwrap());
-            }
-            let mut result = self.inner.result().lock().unwrap();
+                if self.state() == TaskState::Pending {
+                    result.0.replace(Wait::Sync);
+                    self.inner.condvar().wait(result).unwrap()
+                } else {
+                    result
+                }
+            } else {
+                self.inner.result().lock().unwrap()
+            };
             match result.1.take() {
                 Some(result) => {
                     drop(scope);
@@ -270,7 +265,7 @@ impl<T: Send + 'static> Future for Task<T> {
         let mut result = self.inner.result().lock().unwrap();
         match result.1.take() {
             None => {
-                result.0.replace(Event::Async(cx.waker().clone()));
+                result.0.replace(Wait::Async(cx.waker().clone()));
                 Poll::Pending
             }
             Some(r) => Poll::Ready(r),
