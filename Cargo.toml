@@ -1,0 +1,8 @@
+[package]
+name = "asrt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+concurrent-queue = "2.5"
+crossbeam = "0.8"
